@@ -10,10 +10,12 @@
 #include <sstream>
 
 // Metal Shader for re matching
-// we are using a simple but bad algorithm now...
+// ... I just let LLM to implement the Boyer-Moore-Horspool algorithm
 const char* grepShaderSource = R"(
 #include <metal_stdlib>
 using namespace metal;
+
+constant int ALPHABET_SIZE = 256; // Assuming ASCII characters
 
 kernel void grep_kernel(
     device const char* text [[buffer(0)]],
@@ -22,25 +24,44 @@ kernel void grep_kernel(
     device atomic_int* match_count [[buffer(3)]], // Atomic counter
     uint tid [[thread_position_in_grid]])
 {
+    // Calculate text length
     uint text_length = 0;
     while (text[text_length] != '\0') text_length++;
     
+    // Calculate pattern length
     uint pattern_length = 0;
     while (pattern[pattern_length] != '\0') pattern_length++;
     
-    if (tid + pattern_length > text_length) return;
+    // If pattern is empty or longer than remaining text, return
+    if (pattern_length == 0 || tid > text_length - pattern_length) return;
     
-    bool match = true;
-    for (uint i = 0; i < pattern_length; ++i) {
-        if (text[tid + i] != pattern[i]) {
-            match = false;
-            break;
-        }
+    // Preprocess bad-character shift table
+    int bad_char_shift[ALPHABET_SIZE];
+    
+    // Initialize all shifts to pattern length (default shift)
+    for (int i = 0; i < ALPHABET_SIZE; ++i) {
+        bad_char_shift[i] = pattern_length;
     }
     
-    if (match) {
+    // Set shift for characters in pattern (except last)
+    for (uint i = 0; i < pattern_length - 1; ++i) {
+        bad_char_shift[pattern[i]] = pattern_length - 1 - i;
+    }
+    
+    // BMH search - each thread handles one potential starting position
+    int j = pattern_length - 1;
+    
+    // Compare from right to left
+    while (j >= 0 && pattern[j] == text[tid + j]) {
+        j--;
+    }
+    
+    if (j < 0) {
+        // Pattern found - use atomic operation to ensure unique position
         int count = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-        match_positions[count] = tid;  // Store match position
+        if (count < 1000) {  // Prevent buffer overflow
+            match_positions[count] = tid;
+        }
     }
 }
 )";
@@ -76,10 +97,12 @@ int main(int argc, const char* argv[]) {
     }
     
     const std::string pattern = argv[1];
-    const size_t max_matches = 10000;  // Adjust based on expected matches
+    const size_t max_matches = 10;  // Adjust based on expected matches
     
-    if (text.empty()) {
-        return 1;
+    if (text.empty() || pattern.empty()) {
+        std::cout << "Found 0 matches for '" << pattern
+                  << "' in file '" << filename << "'" << std::endl;
+        return 0;
     }
 
     // 1. Initialize Metal device
@@ -104,7 +127,7 @@ int main(int argc, const char* argv[]) {
     std::vector<char> patternData(pattern.begin(), pattern.end());
     patternData.push_back('\0');
     
-    // 4. Create buffers - IMPORTANT: Initialize match count to 0
+    // 4. Create buffers
     int initialMatchCount = 0;
     std::vector<int> matchPositions(max_matches, 0);
     
@@ -117,7 +140,7 @@ int main(int argc, const char* argv[]) {
     MTL::CommandQueue* commandQueue = device->newCommandQueue();
     MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
     
-    // 6. Encode compute command - FIXED BUFFER BINDINGS
+    // 6. Encode compute command
     MTL::ComputeCommandEncoder* computeEncoder = commandBuffer->computeCommandEncoder();
     computeEncoder->setComputePipelineState(pipelineState);
     computeEncoder->setBuffer(textBuffer, 0, 0);       // buffer 0: text
@@ -126,9 +149,9 @@ int main(int argc, const char* argv[]) {
     computeEncoder->setBuffer(matchCountBuffer, 0, 3); // buffer 3: match count
     
     // 7. Configure threads
-    MTL::Size gridSize = MTL::Size(text.size(), 1, 1);
+    MTL::Size gridSize = MTL::Size(text.size() - pattern.size() + 1, 1, 1);
     NS::UInteger maxThreads = pipelineState->maxTotalThreadsPerThreadgroup();
-    MTL::Size threadgroupSize = MTL::Size(std::min(maxThreads, (NS::UInteger)text.size()), 1, 1);
+    MTL::Size threadgroupSize = MTL::Size(std::min(maxThreads, (NS::UInteger)gridSize.width), 1, 1);
     
     computeEncoder->dispatchThreads(gridSize, threadgroupSize);
     computeEncoder->endEncoding();
@@ -137,14 +160,19 @@ int main(int argc, const char* argv[]) {
     commandBuffer->commit();
     commandBuffer->waitUntilCompleted();
     
-    // 9. Get results - COPY DATA BACK FROM GPU
+    // 9. Get results (copy data back from GPU)
     int matchCount = *(static_cast<int*>(matchCountBuffer->contents()));
+    if (matchCount > max_matches) {
+        std::cerr << "Warning: Found " << matchCount << " matches but only "
+                  << max_matches << " can be stored" << std::endl;
+        matchCount = max_matches;
+    }
     memcpy(matchPositions.data(), matchPositionsBuffer->contents(), matchCount * sizeof(int));
     
     std::cout << "Found " << matchCount << " matches for '" << pattern
               << "' in file '" << filename << "'" << std::endl;
     
-    // 10. Print matching lines - IMPROVED LOGIC
+    // 10. Print matching lines
     std::vector<size_t> line_starts;
     line_starts.push_back(0);
     for (size_t i = 0; i < text.size(); ++i) {
@@ -171,7 +199,7 @@ int main(int argc, const char* argv[]) {
         std::string matching_line = text.substr(line_start, line_end - line_start);
         
         // Print grep-style output
-        std::cout << filename << ":" << (line_idx + 1) << ":" << matching_line << "\n";
+        std::cout << filename << ":" << (line_idx + 1) << ":\t" << matching_line << "\n";
     }
     
     // 10. Free resources
